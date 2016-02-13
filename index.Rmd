@@ -1,22 +1,222 @@
 ---
 title: "Practical Machine Learning Project"
-author: "Barrie Hill"
-date: "20 January 2016"
 output: html_document
+date: "12 February 2016"
 ---
+<style type="text/css">
+.table {  width: 60%; }
+</style>
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+## Overview
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+The object of this project is to predict the manner in which six test subjects performed the **Unilateral Dumbbell Biceps Curl** exercise. The six test subjects were asked to perform one set of 10 repetitions of the **Unilateral Dumbbell Biceps Curl** in five different fashions. The classe (Class) variable describes the outcome.
 
-```{r}
-summary(cars)
+
+|Class  | Description                          |
+|-------|--------------------------------------|
+|  A    |Exactly according to the specification|  
+|  B    |Throwing the elbows to the front      |  
+|  C    |Lifting the dumbbell only halfway     |  
+|  D    |Lowering the dumbbell only halfway    |  
+|  E    |Throwing the hips to the front        |  
+
+
+Class A identifies a correct performance of the exercise. The other four classes (B, C, D and E) identify common mistakes in the performance of the exercise.
+
+The [training data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and the [test data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) for this report is sourced from the [Coursera Practical Machine Learning Website](https://www.coursera.org/learn/practical-machine-learning/). The data provided by Coursera is sourced from  [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201) [1] report.
+
+
+
+```{r loadLibraries,echo=FALSE}
+# Load Libraries
+suppressMessages(suppressWarnings(library(caret)))
+suppressMessages(suppressWarnings(library(plyr)))
+suppressMessages(suppressWarnings(library(dplyr)))
+suppressMessages(suppressWarnings(library(randomForest)))
+suppressMessages(suppressWarnings(library(splines)))
+suppressMessages(suppressWarnings(library(gbm)))
+suppressMessages(suppressWarnings(library(survival)))
+suppressMessages(suppressWarnings(library(foreach)))
+suppressMessages(suppressWarnings(library(iterators)))
+suppressMessages(suppressWarnings(library(knitr)))
+suppressMessages(suppressWarnings(library(ggplot2)))
 ```
 
-You can also embed plots, for example:
+## Building the model
 
-```{r, echo=FALSE}
-plot(cars)
+###Partitioning the data
+The [training data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and the [test data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) was downloded and stored locally. The training data was split into three sets (training.set - 60% , testing.set - 20% and validation.set - 20%). The supplied [test data](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv) was set aside to use for the final prediction quiz. The training data was partionioned this way to aid in the cross validation of the final model.
+
+```{r loadAndPartitionData,cache=TRUE,echo=FALSE}
+# Load Data
+# pml.testing <- read.csv("data/pml-testing.csv")
+mydata <- read.csv("data/pml-training.csv")
+# Set seed so the Training, Testing and Vailidation sets will allways
+# be the same
+set.seed(12345)
+# 2. Split data into: Training, Testing, Validation (optional)
+# Splitting Based on the Outcome
+inTrain <- createDataPartition(y=mydata$classe,p=0.60,list=FALSE)
+# Create 60% training set
+training.set <- mydata[inTrain,]
+# Create 40% temporary test set
+test.set <- mydata[-inTrain,]
+# Split temporary test set into 50% partition
+inValidation <- createDataPartition(test.set$classe, p=0.5, list=FALSE)
+# Create 20% testing set
+testing.set <- test.set[inValidation,]
+# Create 20% validation set
+validation.set <- test.set[-inValidation,]
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+### Feature Selection
+
+The features selected for the final training data set were selected based on the principle **To predict X use data related to X**. 
+The object is to predict how a subject performed an exercise based on movement readings from sensors. The first variables removed from the **training.set** were the [near zero variance covariates](http://topepo.github.io/caret/preprocess.html#nzv)[5]. This will improve the stability of the model.
+
+Many variables in the **training.set** consisted of over 97% **NA's**. These variables provide little or no value to the model. These variables were the next to be removed from the **training.set**.
+
+Finally, theses variables **X,user_name,raw_timestamp_part_1,raw_timestamp_part_2,cvtd_timestamp** were removed from the **training.set**. These variables are unrelated to the movement based outcome this model is to predict.
+
+The final set of features selected prior to the model being built was reduced from 160 variables down to 54 variables.
+
+```{r cleanData,echo=FALSE}
+# Removing near zero variance covariates
+nzv <- nearZeroVar(training.set,saveMetrics=TRUE)
+numnzv <- sum(nzv$nzv)
+if (numnzv > 0)
+{
+        training.set <- training.set[, !nzv$nzv]
+}
+# Remove NA's
+training.set <- training.set[, !colSums(is.na(training.set)) > 0]
+
+# Remove unnecessary variables
+training.set <- select(training.set,-X,-user_name,-raw_timestamp_part_1,-raw_timestamp_part_2,-cvtd_timestamp)
+
+```
+
+### Improving Runtime Performance of Caret
+
+Initial testing of the **train()** funtion of the **caret** package were affected by performance problems. Some methods available to **caret** took a long time to run. The [Data Science Specialization Community Practical Machine Learning](https://datasciencespecialization.github.io/pml/) site provided a page containing information about [Improving Runtime Performance of Caret](https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md) [2]. I implemented this suggestion in my code which improved the time it took to run the code.
+
+```{r configureParallelProcessing,echo=FALSE}
+# Improving Runtime Performance of Caret
+# https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+library(parallel)
+library(doParallel)
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+```
+
+## Cross Validation
+
+The method selected for cross validation was to initially split the training set into three partitions, **training.set, testing.set and validation.set**. The model was trained on the **training.set**, then tested on the **testing.set** with a final test in the **validation.set**. 
+
+When configuring the **caret** method **train()**, the **cv (Cross Validation)** method in **trainControl()** was selected with 10 folds. The accuracy was acceptable with these settings and no further cross validation was performed.
+
+## Training the model
+
+Various models were tried using a number of different methods to train a final prediction model. The two methods with the highest accuracy were considered for use as the final prediction model.
+
+```{r predictResults,cache=TRUE,echo=FALSE,results='hide'}
+# Set the seed to 62433 and
+set.seed(62433)
+
+# Configure trainControl
+# Set Cross Validation to 10 steps
+# Allow Parallel processing to speed up processing
+fitControl <- trainControl(method = "cv",
+                           number = 10,
+                           allowParallel = TRUE)
+
+#  predict classe with all the other variables using a random forest ("rf")
+if(file.exists("rfMod.rda")){
+        load("rfMod.rda")
+} else {
+rfMod <- train(classe ~ ., method = "rf", data = training.set,trControl = fitControl)
+save(rfMod,file="rfMod.rda")
+}
+# predict classe with all the other variables using boosted trees ("gbm") 
+if(file.exists("gbmMod.rda")){
+        load("gbmMod.rda")
+} else {
+gbmMod <- train(classe ~ ., method = "gbm", data = training.set,trControl = fitControl)
+save(gbmMod,file="gbmMod.rda")
+}
+
+# Predict using random forest
+prf <- predict(rfMod,training.set)
+# Predict using boosted tree
+pgbm <- predict(gbmMod,training.set)
+rfAccuracy <- confusionMatrix(prf,training.set$classe)$overall[1]
+gbmAccuracy <- confusionMatrix(pgbm,training.set$classe)$overall[1]
+
+```
+* Predicted Random Forest Training Model Accuracy: `r round((rfMod$results$Accuracy[2] * 100),2)`%
+* Predicted Generalized Boosted Regression Training Model Accuracy: `r round((gbmMod$results$Accuracy[9] * 100),2)`%  
+
+The Random Forest model was selected as it had the highest predicted accuracy. The predicted OOB error for the model is 0.27%.
+
+```{r trainingConfusionMatrix,echo=FALSE,fig.width=4}
+kable(confusionMatrix(prf,training.set$classe)$table,caption = "Confusion Matrix for Random Forest Training Model")
+# kable(confusionMatrix(pgbm,training.set$classe)$table,caption = "Confusion Matrix for Generalized Boosted Regression Training Model")
+```
+
+## Validation
+### Testing Set
+```{r validateTestSet,cache=TRUE,echo=FALSE}
+# Predict testing set using random forest
+prf <- predict(rfMod,testing.set)
+rfAccuracy <- confusionMatrix(prf,testing.set$classe)$overall[1]
+# Predict using boosted tree
+#pgbm <- predict(gbmMod,testing.set)
+#gbmAccuracy <- confusionMatrix(pgbm,testing.set$classe)$overall[1]
+```
+
+The trained random forest model was used to predict against the testing set. The Testing Random Forest Model Accuracy was `r round((rfAccuracy * 100),2)`%. The error was `r 100 - round((rfAccuracy * 100),2)`%. The results were accecptable and no further tuning was done. The confusion matrix below shows the results of the observed and predicted classes for the testing data set.
+
+```{r testingConfusionMatrix,echo=FALSE}
+# Format testing set confusion matrix
+kable(confusionMatrix(prf,testing.set$classe)$table,caption = "Confusion Matrix for Random Forest Testing Model")
+```
+
+### Validation Set
+```{r checkValiadationSet,cache=TRUE,echo=FALSE}
+# Validation
+
+# Predict validation set using random forest
+prf <- predict(rfMod,validation.set)
+rfAccuracy <- confusionMatrix(prf,validation.set$classe)$overall[1]
+```
+The trained random forest model was used once to predict against the validation set. The Validation Random Forest Model Accuracy was `r round((rfAccuracy * 100),2)`%. The error was `r 100 - round((rfAccuracy * 100),2)`%. The confusion matrix below shows the results of the observed and predicted classes for the validation data set.
+
+```{r validationConfusionMatrix,echo=FALSE}
+# Format validation confusion matrix
+kable(confusionMatrix(prf,validation.set$classe)$table,caption = "Confusion Matrix for Random Forest Validation Model")
+# Stop parallel processing
+stopCluster(cluster)
+```
+
+## Out of Sample Error
+[Wikipedia](https://en.wikipedia.org) states the [generalization error](https://en.wikipedia.org/wiki/Generalization_error)(also known as the out-of-sample error)[4] is the difference between the expected and empirical error. The estimate for the **out of sample error** for a random forest model is the **out of bag (OOB)** error. 
+
+For the random forest model trained using the training set in this project, the predicted **out of sample(OOB)** error is 0.27%.
+
+
+## Conclusion
+The first run of the model trained in this project against the **test set for Quiz 4** successfully predicted 20 correct answers for the 20 questions in Quiz 4.
+
+Although there was 100% accuracy in predicting the results in Quiz 4, the speed of prediction using the model may be able to be improved by further reducing the number of features by using the importance of the variables.
+
+
+## References
+
+[1] Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. [Qualitative Activity Recognition of Weight Lifting Exercises](http://groupware.les.inf.puc-rio.br/work.jsf?p1=11201). Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013.
+
+[2] Len Greski Improving Runtime Performance of Caret - https://github.com/lgreski/datasciencectacontent/blob/master/markdown/pml-randomForestPerformance.md
+
+[3] Wikipedia: Random Forest - https://en.wikipedia.org/wiki/Random_forest
+
+[4] Wikipedia: Generalization error - https://en.wikipedia.org/wiki/Generalization_error
+[5] topepo - http://topepo.github.io/caret/preprocess.html#nzv
